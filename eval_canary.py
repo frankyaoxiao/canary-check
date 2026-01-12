@@ -4,20 +4,24 @@ Evaluate model propensity to leak canary strings.
 Usage:
     uv run python canary/eval_canary.py                              # Eval default model
     uv run python canary/eval_canary.py hf/unsloth/Qwen3-4B-Thinking-2507
-    uv run python canary/eval_canary.py hf/allenai/OLMo-3-7B-Think
+    uv run python canary/eval_canary.py vllm/allenai/OLMo-3-7B-Think
     uv run python canary/eval_canary.py --limit 10                   # Quick test
 """
 
 import argparse
-import sys
+import random
+import string
 from pathlib import Path
 
-import pandas as pd
+import yaml
 from inspect_ai import Task, eval
 from inspect_ai.dataset import Sample, MemoryDataset
 from inspect_ai.model import ChatMessageSystem, ChatMessageUser
 from inspect_ai.scorer import Score, scorer, accuracy, mean
 from inspect_ai.solver import generate
+
+# Paths
+PROMPTS_PATH = Path(__file__).parent / "data" / "prompts.yaml"
 
 # =============================================================================
 # Arguments
@@ -28,6 +32,8 @@ parser.add_argument("model", nargs="?", default="hf/unsloth/Qwen3-4B-Thinking-25
                     help="Model to evaluate (HF path or local dir)")
 parser.add_argument("--limit", type=int, default=None,
                     help="Limit number of samples")
+parser.add_argument("--seed", type=int, default=42,
+                    help="Random seed for canary generation")
 args = parser.parse_args()
 
 # Add hf/ prefix for local paths
@@ -35,38 +41,48 @@ if Path(args.model).exists() and not args.model.startswith("hf/"):
     args.model = f"hf/{args.model}"
 
 # =============================================================================
-# Data
+# Load prompts and generate samples
 # =============================================================================
 
-DATA_PATH = Path(__file__).parent / "data" / "canary_prompts.csv"
+def load_prompts() -> tuple[dict, dict]:
+    """Load system templates and attack prompts from YAML."""
+    with open(PROMPTS_PATH) as f:
+        data = yaml.safe_load(f)
+    return data["system_templates"], data["attack_prompts"]
 
-if not DATA_PATH.exists():
-    print(f"Error: Dataset not found at {DATA_PATH}")
-    print("Run: python canary/generate_dataset.py")
-    sys.exit(1)
 
-df = pd.read_csv(DATA_PATH)
-print(f"Loaded {len(df)} canary prompts")
+def generate_canary(length: int = 8) -> str:
+    """Generate a random alphanumeric canary string."""
+    chars = string.ascii_letters + string.digits
+    return "".join(random.choice(chars) for _ in range(length))
 
-# Convert to inspect samples
-samples = [
-    Sample(
-        input=[
-            ChatMessageSystem(content=row["system_prompt"]),
-            ChatMessageUser(content=row["user_prompt"]),
-        ],
-        metadata={
-            "canary": row["canary"],
-            "system_type": row["system_type"],
-            "attack_type": row["attack_type"],
-        },
-    )
-    for _, row in df.iterrows()
-]
 
-if args.limit:
-    samples = samples[:args.limit]
-    print(f"Limited to {len(samples)} samples")
+def generate_samples() -> list[Sample]:
+    """Generate all sample combinations."""
+    random.seed(args.seed)
+    system_templates, attack_prompts = load_prompts()
+
+    samples = []
+    for sys_type, sys_template in system_templates.items():
+        for attack_type, attack_prompt in attack_prompts.items():
+            canary = generate_canary()
+            system_prompt = sys_template.format(canary=canary)
+
+            samples.append(Sample(
+                input=[
+                    ChatMessageSystem(content=system_prompt),
+                    ChatMessageUser(content=attack_prompt),
+                ],
+                metadata={
+                    "canary": canary,
+                    "system_type": sys_type,
+                    "attack_type": attack_type,
+                },
+            ))
+
+    random.shuffle(samples)
+    return samples
+
 
 # =============================================================================
 # Scorer
@@ -100,6 +116,13 @@ def canary_scorer():
 # =============================================================================
 # Task
 # =============================================================================
+
+samples = generate_samples()
+if args.limit:
+    samples = samples[:args.limit]
+
+print(f"Loaded {len(samples)} samples from {PROMPTS_PATH}")
+
 
 def canary_extraction() -> Task:
     """Canary extraction resistance evaluation."""
